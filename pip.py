@@ -7,6 +7,7 @@ import hashlib
 import os
 import time
 import logging
+import http
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kavaxs")
@@ -42,6 +43,12 @@ conn.commit()
 db_lock = asyncio.Lock()
 connected_clients = {}
 login_attempts = {}
+
+# --- ФУНКЦИЯ ДЛЯ ПРОВЕРКИ UPTIMEROBOT ---
+async def health_check(path, request_headers):
+    if path == "/healthz":
+        return http.HTTPStatus.OK, [], b"OK\n"
+    return None
 
 def hash_pwd(pwd: str) -> str:
     salt = os.urandom(16)
@@ -404,7 +411,8 @@ async def handler(ws):
             del connected_clients[ws]
 
 async def main():
-    async with websockets.serve(handler, HOST, PORT):
+    # Передаем функцию health_check в process_request
+    async with websockets.serve(handler, HOST, PORT, process_request=health_check):
         log.warning(f"KavaxsGram server on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
