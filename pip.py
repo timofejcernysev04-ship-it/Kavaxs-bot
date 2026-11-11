@@ -418,3 +418,16 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+elif t == "search":
+    if not client_phone: continue
+    query = (data.get("query") or "").strip()
+    if not query: continue
+    async with db_lock:
+        c.execute("SELECT phone FROM users WHERE phone LIKE ? OR username LIKE ? OR name LIKE ? LIMIT 20", (f"%{query}%", f"%{query}%", f"%{query}%"))
+        rows = c.fetchall()
+        results = []
+        for r in rows:
+            u = get_user_data(r[0], client_phone)
+            if u and u["phone"] != client_phone:
+                results.append(u)
+    await send(ws, {"type": "search_result", "results": results})
