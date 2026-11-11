@@ -44,7 +44,6 @@ db_lock = asyncio.Lock()
 connected_clients = {}
 login_attempts = {}
 
-# --- ФУНКЦИЯ ДЛЯ ПРОВЕРКИ UPTIMEROBOT ---
 async def health_check(path, request_headers):
     if path == "/healthz":
         return http.HTTPStatus.OK, [], b"OK\n"
@@ -156,6 +155,22 @@ async def handler(ws):
                     conn.commit()
                 user_data = get_user_data(phone, phone); user_data["type"] = "auth_ok"; user_data["gifts"] = get_user_gifts(phone); user_data["posts"] = get_user_posts(phone)
                 await send(ws, user_data)
+
+            # --- ПОИСК ---
+            elif t == "search":
+                if not client_phone: continue
+                query = (data.get("query") or "").strip()
+                if not query: continue
+                async with db_lock:
+                    c.execute("SELECT phone FROM users WHERE phone LIKE ? OR username LIKE ? OR name LIKE ? LIMIT 20", (f"%{query}%", f"%{query}%", f"%{query}%"))
+                    rows = c.fetchall()
+                    results = []
+                    for r in rows:
+                        u = get_user_data(r[0], client_phone)
+                        if u and u["phone"] != client_phone: # не показываем себя
+                            results.append(u)
+                await send(ws, {"type": "search_result", "results": results})
+            # -------------
 
             elif t == "get_profile":
                 target = data.get("target")
@@ -411,23 +426,9 @@ async def handler(ws):
             del connected_clients[ws]
 
 async def main():
-    # Передаем функцию health_check в process_request
     async with websockets.serve(handler, HOST, PORT, process_request=health_check):
         log.warning(f"KavaxsGram server on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
-elif t == "search":
-    if not client_phone: continue
-    query = (data.get("query") or "").strip()
-    if not query: continue
-    async with db_lock:
-        c.execute("SELECT phone FROM users WHERE phone LIKE ? OR username LIKE ? OR name LIKE ? LIMIT 20", (f"%{query}%", f"%{query}%", f"%{query}%"))
-        rows = c.fetchall()
-        results = []
-        for r in rows:
-            u = get_user_data(r[0], client_phone)
-            if u and u["phone"] != client_phone:
-                results.append(u)
-    await send(ws, {"type": "search_result", "results": results})
