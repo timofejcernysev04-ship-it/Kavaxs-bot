@@ -29,16 +29,23 @@ CREATE TABLE IF NOT EXISTS users (
     hide_username INTEGER DEFAULT 0, hide_phone INTEGER DEFAULT 0, is_premium INTEGER DEFAULT 0,
     is_banned INTEGER DEFAULT 0, is_scam INTEGER DEFAULT 0, is_fake INTEGER DEFAULT 0, ip TEXT,
     bio TEXT DEFAULT '', avatar TEXT DEFAULT '', bg TEXT DEFAULT '', kstars INTEGER DEFAULT 0,
-    reactions TEXT DEFAULT '["❤️","👍","🔥","😂","😮","😢"]', fake_phone TEXT DEFAULT ''
+    reactions TEXT DEFAULT '["❤️","👍","🔥","😂","😮","😢"]', fake_phone TEXT DEFAULT '',
+    is_zam INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, target TEXT NOT NULL, date TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, name TEXT NOT NULL, target TEXT NOT NULL, text TEXT NOT NULL, date TEXT NOT NULL, reply_to_id INTEGER, forward_from TEXT, is_deleted INTEGER DEFAULT 0, media_type TEXT, media_data TEXT);
 CREATE TABLE IF NOT EXISTS reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id INTEGER NOT NULL, phone TEXT NOT NULL, emoji TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, target TEXT NOT NULL, gift_type TEXT NOT NULL, price INTEGER DEFAULT 10, date TEXT NOT NULL, is_sold INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, target TEXT NOT NULL, gift_type TEXT NOT NULL, price INTEGER DEFAULT 10, date TEXT NOT NULL, is_sold INTEGER DEFAULT 0, message TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, date TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, image TEXT NOT NULL, date TEXT NOT NULL);
 """)
 conn.commit()
+
+# Миграция для добавления новых колонок в старую БД
+try: c.execute("ALTER TABLE users ADD COLUMN is_zam INTEGER DEFAULT 0"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE gifts ADD COLUMN message TEXT DEFAULT ''"); conn.commit()
+except: pass
 
 db_lock = asyncio.Lock()
 connected_clients = {}
@@ -83,7 +90,7 @@ async def broadcast_to_phones(phones, payload):
             except: pass
 
 def get_user_data(phone, viewer_phone=None):
-    c.execute("SELECT name,phone,username,is_premium,is_scam,is_fake,bio,avatar,bg,kstars,ip,reactions,fake_phone FROM users WHERE phone=?", (phone,))
+    c.execute("SELECT name,phone,username,is_premium,is_scam,is_fake,bio,avatar,bg,kstars,ip,reactions,fake_phone,is_zam FROM users WHERE phone=?", (phone,))
     row = c.fetchone()
     if not row: return None
     real_phone = row[1]
@@ -91,20 +98,30 @@ def get_user_data(phone, viewer_phone=None):
     display_phone = real_phone
     if viewer_phone != real_phone and viewer_phone != ADMIN_PHONE and fake:
         display_phone = fake
-    return {"name": row[0], "phone": display_phone, "real_phone": real_phone, "username": row[2], "is_premium": row[3], "is_scam": row[4], "is_fake": row[5], "bio": row[6], "avatar": row[7], "bg": row[8], "kstars": row[9], "ip": row[10], "reactions": json.loads(row[11] or '[]'), "is_admin": real_phone == ADMIN_PHONE}
+    return {
+        "name": row[0], "phone": display_phone, "real_phone": real_phone, "username": row[2], 
+        "is_premium": row[3], "is_scam": row[4], "is_fake": row[5], "bio": row[6], "avatar": row[7], 
+        "bg": row[8], "kstars": row[9], "ip": row[10], "reactions": json.loads(row[11] or '[]'), 
+        "is_admin": real_phone == ADMIN_PHONE, "is_zam": row[13] == 1
+    }
 
 def get_user_posts(phone):
     c.execute("SELECT id, image, date FROM posts WHERE phone=? ORDER BY id DESC", (phone,))
     return [{"id": r[0], "image": r[1], "date": r[2]} for r in c.fetchall()]
 
 def get_user_gifts(phone):
-    c.execute("SELECT id, gift_type, sender, date, price, is_sold FROM gifts WHERE target=? AND is_sold=0 ORDER BY id DESC", (phone,))
+    c.execute("SELECT id, gift_type, sender, date, price, is_sold, message FROM gifts WHERE target=? AND is_sold=0 ORDER BY id DESC", (phone,))
     rows = c.fetchall()
     gifts = []
     for r in rows:
         c.execute("SELECT name, avatar FROM users WHERE phone=?", (r[2],))
         sender = c.fetchone()
-        gifts.append({"id": r[0], "type": r[1], "sender": r[2], "sender_name": sender[0] if sender else "Неизвестно", "sender_avatar": sender[1] if sender else "", "date": r[3], "price": r[4], "is_sold": r[5]})
+        gifts.append({
+            "id": r[0], "type": r[1], "sender": r[2], 
+            "sender_name": sender[0] if sender else "Неизвестно", 
+            "sender_avatar": sender[1] if sender else "", 
+            "date": r[3], "price": r[4], "is_sold": r[5], "message": r[6]
+        })
     return gifts
 
 def get_user_transactions(phone):
@@ -156,7 +173,6 @@ async def handler(ws):
                 user_data = get_user_data(phone, phone); user_data["type"] = "auth_ok"; user_data["gifts"] = get_user_gifts(phone); user_data["posts"] = get_user_posts(phone)
                 await send(ws, user_data)
 
-            # --- ПОИСК ---
             elif t == "search":
                 if not client_phone: continue
                 query = (data.get("query") or "").strip()
@@ -167,10 +183,9 @@ async def handler(ws):
                     results = []
                     for r in rows:
                         u = get_user_data(r[0], client_phone)
-                        if u and u["phone"] != client_phone: # не показываем себя
+                        if u and u["phone"] != client_phone:
                             results.append(u)
                 await send(ws, {"type": "search_result", "results": results})
-            # -------------
 
             elif t == "get_profile":
                 target = data.get("target")
@@ -209,24 +224,29 @@ async def handler(ws):
                     posts = get_user_posts(client_phone)
                 await send(ws, {"type": "posts_updated", "posts": posts})
 
-            elif t == "admin_set_fake":
-                if client_phone == ADMIN_PHONE:
-                    target = data.get("target")
-                    fake_num = data.get("fake_phone")
-                    async with db_lock:
-                        c.execute("UPDATE users SET fake_phone=? WHERE phone=?", (fake_num, target))
-                        conn.commit()
-                    await send(ws, {"type": "admin_ok", "msg": "Фейковый номер установлен"})
-
             elif t == "admin_get_users":
-                if client_phone == ADMIN_PHONE:
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     async with db_lock:
-                        c.execute("SELECT phone, name, is_banned, is_premium, ip, kstars FROM users LIMIT 50")
-                        users = [{"phone": r[0], "name": r[1], "is_banned": r[2], "is_premium": r[3], "ip": r[4], "kstars": r[5]} for r in c.fetchall()]
+                        c.execute("SELECT phone, name, is_banned, is_premium, ip, kstars, is_zam FROM users LIMIT 50")
+                        users = []
+                        for r in c.fetchall():
+                            users.append({
+                                "phone": r[0], "name": r[1], "is_banned": r[2], "is_premium": r[3], 
+                                "ip": r[4], "kstars": r[5], "is_zam": r[6],
+                                "is_main_admin": r[0] == ADMIN_PHONE
+                            })
                     await send(ws, {"type": "admin_users_list", "users": users})
 
-            elif t == "admin_unban":
+            elif t == "admin_make_zam":
                 if client_phone == ADMIN_PHONE:
+                    target = data.get("target")
+                    async with db_lock:
+                        c.execute("UPDATE users SET is_zam=1 WHERE phone=?", (target,))
+                        conn.commit()
+                    await send(ws, {"type": "admin_ok", "msg": "Пользователь назначен Замом!"})
+
+            elif t == "admin_unban":
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     target = data.get("target")
                     async with db_lock:
                         c.execute("UPDATE users SET is_banned=0 WHERE phone=?", (target,))
@@ -234,8 +254,12 @@ async def handler(ws):
                     await send(ws, {"type": "admin_ok", "msg": "Разбанен!"})
 
             elif t == "admin_ban":
-                if client_phone == ADMIN_PHONE:
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     target, ban_type = data.get("target"), data.get("ban_type")
+                    
+                    if client_phone != ADMIN_PHONE and target == ADMIN_PHONE:
+                        await send(ws, {"type": "error", "msg": "Вы не можете забанить Главного Админа!"}); continue
+                    
                     kick = set()
                     async with db_lock:
                         if ban_type == "phone":
@@ -252,7 +276,7 @@ async def handler(ws):
                             connected_clients.pop(client, None)
 
             elif t == "admin_give_kstars":
-                if client_phone == ADMIN_PHONE:
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     target = data.get("target")
                     amount = data.get("amount", 100)
                     async with db_lock:
@@ -261,19 +285,28 @@ async def handler(ws):
                     await send(ws, {"type": "admin_ok", "msg": f"Начислено {amount} K-Star"})
 
             elif t == "admin_broadcast":
-                if client_phone == ADMIN_PHONE:
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     text = data.get("text")
                     payload = {"type": "msg", "sender": "admin", "name": "Админ", "target": "general", "text": text, "date": now_str()}
                     for client in list(connected_clients.keys()): await send(client, payload)
 
             elif t == "admin_give_gift":
-                if client_phone == ADMIN_PHONE:
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     target = data.get("target")
                     gift_type = data.get("gift_type")
                     async with db_lock:
                         c.execute("INSERT INTO gifts (sender, target, gift_type, price, date) VALUES (?,?,?,?,?)", (ADMIN_PHONE, target, gift_type, 0, now_str()))
                         conn.commit()
                     await send(ws, {"type": "admin_ok", "msg": "Подарок выдан"})
+
+            elif t == "admin_set_fake":
+                if client_phone == ADMIN_PHONE:
+                    target = data.get("target")
+                    fake_num = data.get("fake_phone")
+                    async with db_lock:
+                        c.execute("UPDATE users SET fake_phone=? WHERE phone=?", (fake_num, target))
+                        conn.commit()
+                    await send(ws, {"type": "admin_ok", "msg": "Фейковый номер установлен"})
 
             elif t == "msg":
                 if not client_phone: continue
