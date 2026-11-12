@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS users (
     is_banned INTEGER DEFAULT 0, is_scam INTEGER DEFAULT 0, is_fake INTEGER DEFAULT 0, ip TEXT,
     bio TEXT DEFAULT '', avatar TEXT DEFAULT '', bg TEXT DEFAULT '', kstars INTEGER DEFAULT 0,
     reactions TEXT DEFAULT '["❤️","👍","🔥","😂","😮","😢"]', fake_phone TEXT DEFAULT '',
-    is_zam INTEGER DEFAULT 0
+    is_zam INTEGER DEFAULT 0, custom_badge TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, target TEXT NOT NULL, date TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, name TEXT NOT NULL, target TEXT NOT NULL, text TEXT NOT NULL, date TEXT NOT NULL, reply_to_id INTEGER, forward_from TEXT, is_deleted INTEGER DEFAULT 0, media_type TEXT, media_data TEXT);
@@ -41,8 +41,10 @@ CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TE
 """)
 conn.commit()
 
-# Миграция для добавления новых колонок в старую БД
+# Миграция для старых баз данных
 try: c.execute("ALTER TABLE users ADD COLUMN is_zam INTEGER DEFAULT 0"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE users ADD COLUMN custom_badge TEXT DEFAULT ''"); conn.commit()
 except: pass
 try: c.execute("ALTER TABLE gifts ADD COLUMN message TEXT DEFAULT ''"); conn.commit()
 except: pass
@@ -90,7 +92,7 @@ async def broadcast_to_phones(phones, payload):
             except: pass
 
 def get_user_data(phone, viewer_phone=None):
-    c.execute("SELECT name,phone,username,is_premium,is_scam,is_fake,bio,avatar,bg,kstars,ip,reactions,fake_phone,is_zam FROM users WHERE phone=?", (phone,))
+    c.execute("SELECT name,phone,username,is_premium,is_scam,is_fake,bio,avatar,bg,kstars,ip,reactions,fake_phone,is_zam,custom_badge FROM users WHERE phone=?", (phone,))
     row = c.fetchone()
     if not row: return None
     real_phone = row[1]
@@ -102,7 +104,7 @@ def get_user_data(phone, viewer_phone=None):
         "name": row[0], "phone": display_phone, "real_phone": real_phone, "username": row[2], 
         "is_premium": row[3], "is_scam": row[4], "is_fake": row[5], "bio": row[6], "avatar": row[7], 
         "bg": row[8], "kstars": row[9], "ip": row[10], "reactions": json.loads(row[11] or '[]'), 
-        "is_admin": real_phone == ADMIN_PHONE, "is_zam": row[13] == 1
+        "is_admin": real_phone == ADMIN_PHONE, "is_zam": row[13] == 1, "custom_badge": row[14] or ""
     }
 
 def get_user_posts(phone):
@@ -215,6 +217,14 @@ async def handler(ws):
                     conn.commit()
                 await send(ws, {"type": "bio_ok", "bio": new_bio})
 
+            elif t == "set_custom_badge":
+                if not client_phone: continue
+                badge_text = data.get("badge", "")[:8].upper()
+                async with db_lock:
+                    c.execute("UPDATE users SET custom_badge=? WHERE phone=?", (badge_text, client_phone))
+                    conn.commit()
+                await send(ws, {"type": "admin_ok", "msg": "Бейдж сохранен"})
+
             elif t == "add_post":
                 if not client_phone: continue
                 image = data.get("image")
@@ -223,6 +233,8 @@ async def handler(ws):
                     conn.commit()
                     posts = get_user_posts(client_phone)
                 await send(ws, {"type": "posts_updated", "posts": posts})
+
+            # ================= АДМИНКА =================
 
             elif t == "admin_get_users":
                 if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
@@ -245,6 +257,22 @@ async def handler(ws):
                         conn.commit()
                     await send(ws, {"type": "admin_ok", "msg": "Пользователь назначен Замом!"})
 
+            elif t == "admin_give_premium":
+                if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
+                    target = data.get("target")
+                    async with db_lock:
+                        c.execute("UPDATE users SET is_premium=1 WHERE phone=?", (target,))
+                        conn.commit()
+                    await send(ws, {"type": "admin_ok", "msg": "Premium выдан!"})
+
+            elif t == "admin_remove_premium":
+                if client_phone == ADMIN_PHONE:
+                    target = data.get("target")
+                    async with db_lock:
+                        c.execute("UPDATE users SET is_premium=0 WHERE phone=?", (target,))
+                        conn.commit()
+                    await send(ws, {"type": "admin_ok", "msg": "Premium снят!"})
+
             elif t == "admin_unban":
                 if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
                     target = data.get("target")
@@ -255,19 +283,15 @@ async def handler(ws):
 
             elif t == "admin_ban":
                 if client_phone == ADMIN_PHONE or get_user_data(client_phone, client_phone)["is_zam"]:
-                    target, ban_type = data.get("target"), data.get("ban_type")
+                    target = data.get("target")
                     
+                    # ЗАЩИТА ГЛАВНОГО АДМИНА
                     if client_phone != ADMIN_PHONE and target == ADMIN_PHONE:
                         await send(ws, {"type": "error", "msg": "Вы не можете забанить Главного Админа!"}); continue
                     
                     kick = set()
                     async with db_lock:
-                        if ban_type == "phone":
-                            c.execute("UPDATE users SET is_banned=1 WHERE phone=?", (target,)); kick.add(target)
-                        elif ban_type == "ip":
-                            c.execute("SELECT phone FROM users WHERE ip=(SELECT ip FROM users WHERE phone=?)", (target,))
-                            kick = {r[0] for r in c.fetchall()}
-                            c.execute("UPDATE users SET is_banned=1 WHERE ip=(SELECT ip FROM users WHERE phone=?)", (target,))
+                        c.execute("UPDATE users SET is_banned=1 WHERE phone=?", (target,)); kick.add(target)
                         conn.commit()
                     await send(ws, {"type": "admin_ok", "msg": "Забанен"})
                     for client, info in list(connected_clients.items()):
@@ -307,6 +331,8 @@ async def handler(ws):
                         c.execute("UPDATE users SET fake_phone=? WHERE phone=?", (fake_num, target))
                         conn.commit()
                     await send(ws, {"type": "admin_ok", "msg": "Фейковый номер установлен"})
+
+            # ================= СООБЩЕНИЯ =================
 
             elif t == "msg":
                 if not client_phone: continue
@@ -390,6 +416,8 @@ async def handler(ws):
                     if user_data: hist.append(user_data)
                 await send(ws, {"type": "history_result", "history": hist})
 
+            # ================= ПОДАРКИ =================
+
             elif t == "buy_gift":
                 if not client_phone: continue
                 gift_type = data.get("gift_type")
@@ -431,19 +459,21 @@ async def handler(ws):
                 target = data.get("target")
                 gift_type = data.get("gift_type")
                 price = int(data.get("price", 10))
+                gift_msg = data.get("message", "") # Получаем текст подарка
+                
                 async with db_lock:
                     c.execute("SELECT kstars FROM users WHERE phone=?", (client_phone,))
                     bal = c.fetchone()[0]
                     if bal < price:
                         await send(ws, {"type": "error", "msg": f"Недостаточно K-Star!"}); continue
                     c.execute("UPDATE users SET kstars = kstars - ? WHERE phone=?", (price, client_phone))
-                    c.execute("INSERT INTO gifts (sender, target, gift_type, price, date) VALUES (?,?,?,?,?)", (client_phone, target, gift_type, price, now_str()))
+                    c.execute("INSERT INTO gifts (sender, target, gift_type, price, date, message) VALUES (?,?,?,?,?,?)", (client_phone, target, gift_type, price, now_str(), gift_msg))
                     c.execute("INSERT INTO transactions (phone, amount, reason, date) VALUES (?, ?, ?, ?)", (client_phone, -price, f"Подарок: {gift_type}", now_str()))
                     conn.commit()
                     c.execute("SELECT name, avatar FROM users WHERE phone=?", (client_phone,))
                     s_name, s_av = c.fetchone()
                 
-                payload = {"type": "gift_received", "sender": client_phone, "sender_name": s_name, "sender_avatar": s_av, "target": target, "gift": {"type": gift_type, "price": price, "sender_name": s_name, "sender_avatar": s_av}}
+                payload = {"type": "gift_received", "sender": client_phone, "sender_name": s_name, "sender_avatar": s_av, "target": target, "gift": {"type": gift_type, "price": price, "sender_name": s_name, "sender_avatar": s_av, "message": gift_msg}}
                 await send(ws, {"type": "gift_ok", "msg": "Подарок отправлен!"})
                 await broadcast_to_phones({target}, payload)
 
